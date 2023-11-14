@@ -46,6 +46,21 @@ fn cat_file(object: String) -> Result<()> {
     if !valid_partial_sha1_name(&object) {
         bail!("Not a valid object name {}", object);
     }
+    let (prefix, rest) = &object.split_at(2);
+    println!("Prefix: '{prefix}', rest: '{rest}'");
+    let mut dir = PathBuf::from(".git/objects");
+    dir.push(prefix);
+    let mut candidates = fs::read_dir(dir)?
+        .into_iter()
+        .filter(|e| e.as_ref().is_ok_and(|e| {
+            e.path().file_name().unwrap().to_string_lossy().starts_with(rest)
+        }))
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        bail!("Not a valid object name {}", object);
+    }
+
+    let path = candidates.pop().unwrap()?.path();
 
     Ok(())
 }
