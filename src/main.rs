@@ -1,7 +1,10 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, io::{BufReader, BufRead, Read, Write, self}};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use flate2::read::ZlibDecoder;
+
+const BUF_SIZE: usize = 4096;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -40,14 +43,13 @@ fn valid_partial_sha1_name(name: &str) -> bool {
         name.chars().all(|c| ('0'..='9').contains(&c) || ('a'..='z').contains(&c))
 }
 
-fn cat_file(object: String) -> Result<()> {
+fn cat_file<W: Write>(object: String, mut output: W) -> Result<()> {
     let object = object.to_lowercase();
 
     if !valid_partial_sha1_name(&object) {
         bail!("Not a valid object name {}", object);
     }
     let (prefix, rest) = &object.split_at(2);
-    println!("Prefix: '{prefix}', rest: '{rest}'");
     let mut dir = PathBuf::from(".git/objects");
     dir.push(prefix);
     let mut candidates = fs::read_dir(dir)?
@@ -61,6 +63,26 @@ fn cat_file(object: String) -> Result<()> {
     }
 
     let path = candidates.pop().unwrap()?.path();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(path)?;
+    let decoder = ZlibDecoder::new(file);
+    let mut reader = BufReader::new(decoder);
+    let mut header = vec![];
+    reader.read_until(0, &mut header)?;
+    let header = String::from_utf8(header)?;
+    if header.starts_with("blob ") {
+        let (_, raw_length) = header.split_at(5);
+        let mut left = raw_length[..(raw_length.len() - 1)].parse::<usize>()?;
+        let mut buf = vec![0; BUF_SIZE];
+        while left > 0 {
+            let to_read = std::cmp::min(BUF_SIZE, left);
+            reader.read_exact(&mut buf[..to_read])?;
+            left -= to_read;
+            output.write(&buf[..to_read])?;
+        } 
+        output.flush()?;
+    }
 
     Ok(())
 }
@@ -71,7 +93,7 @@ fn do_command(cli: Cli) -> Result<()> {
             initialize_git_directory()?;
         },
         Commands::CatFile { object, .. } => {
-            cat_file(object)?;
+            cat_file(object, io::stdout())?;
         }
     }
 
