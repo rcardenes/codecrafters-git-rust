@@ -28,12 +28,18 @@ enum Commands {
         p: bool,
         object: String,
     },
-    /// 
+    /// Compute object ID and optionally creates a blob from a file
     HashObject {
         #[arg(short)]
         w: bool,
         object: Vec<String>,
-    }
+    },
+    /// List the contents of a tree object
+    LsTree {
+        #[arg(long, required = true)]
+        name_only: bool,
+        tree_ish: String,
+    },
 }
 
 fn initialize_git_directory() -> Result<()> {
@@ -64,28 +70,33 @@ fn valid_partial_sha1_name(name: &str) -> bool {
         name.chars().all(|c| ('0'..='9').contains(&c) || ('a'..='z').contains(&c))
 }
 
-fn cat_file<W: Write>(object: String, mut output: W) -> Result<()> {
+fn get_object_path(object: &str) -> Result<PathBuf> {
     let object = object.to_lowercase();
 
     if !valid_partial_sha1_name(&object) {
         bail!("Not a valid object name {}", object);
     }
+
     let (prefix, rest) = &object.split_at(2);
     let mut dir = find_git_dir()?;
     dir.push("objects");
     dir.push(prefix);
+
     let mut candidates = fs::read_dir(dir)?
         .into_iter()
         .filter(|e| e.as_ref().is_ok_and(|e| {
             e.path().file_name().unwrap().to_string_lossy().starts_with(rest)
         }))
-        .collect::<Vec<_>>();
+    .collect::<Vec<_>>();
     if candidates.len() != 1 {
         bail!("Not a valid object name {}", object);
     }
 
-    let path = candidates.pop().unwrap()?.path();
-    let file = fs::File::open(path)?;
+    Ok(candidates.pop().unwrap()?.path())
+}
+
+fn cat_file<W: Write>(object: String, mut output: W) -> Result<()> {
+    let file = fs::File::open(get_object_path(&object)?)?;
     let decoder = ZlibDecoder::new(file);
     let mut reader = BufReader::new(decoder);
     let mut header = vec![];
@@ -117,6 +128,9 @@ fn ensure_dir(mut path: PathBuf, subdir: &str) -> Result<PathBuf> {
 }
 
 fn hash_object<W: Write>(objects: Vec<String>, persist: bool, mut output: W) -> Result<()> {
+    // TODO: This can be done in a much more efficient way, writing to both the hasher
+    // and the destination file (if persisting) at the same time. Leave it for
+    // later.
     let objects_dir = ensure_dir(find_git_dir()?, "objects")?;
     for object in objects {
         let mut hasher = Sha1::new();
@@ -150,6 +164,38 @@ fn hash_object<W: Write>(objects: Vec<String>, persist: bool, mut output: W) -> 
     Ok(())
 }
 
+const SHA1_LENGTH: usize = 20;
+
+fn ls_tree<W: Write>(object: String, mut output: W) -> Result<()> {
+    let file = fs::File::open(get_object_path(&object)?)?;
+    let decoder = ZlibDecoder::new(file);
+    let mut reader = BufReader::new(decoder);
+    let mut header = vec![];
+    reader.read_until(0, &mut header)?;
+    let header = String::from_utf8(header)?;
+
+    if header.starts_with("tree ") {
+        let (_, raw_length) = header.split_at(5);
+        let mut left = raw_length[..(raw_length.len() - 1)].parse::<usize>()?;
+
+        let mut hash_buf = vec![0; SHA1_LENGTH];
+        while left > 0 {
+            let mut path_header_raw = vec![];
+            let header_bytes = reader.read_until(0, &mut path_header_raw)?;
+            reader.read_exact(&mut hash_buf)?;
+            if let Some((_, vec)) = String::from_utf8(path_header_raw)?.split_once(" ") {
+                left -= header_bytes + SHA1_LENGTH;
+                writeln!(output, "{}", &vec[..vec.len() - 1])?;
+            } else {
+                bail!("corrupt stuff!")
+            }
+        } 
+        output.flush()?;
+    }
+
+    Ok(())
+}
+
 fn do_command(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init => {
@@ -160,6 +206,9 @@ fn do_command(cli: Cli) -> Result<()> {
         }
         Commands::HashObject { w, object } => {
             hash_object(object, w, io::stdout())?;
+        }
+        Commands::LsTree { tree_ish, .. } => {
+            ls_tree(tree_ish, io::stdout())?;
         }
     }
 
