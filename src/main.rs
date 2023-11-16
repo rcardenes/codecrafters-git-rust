@@ -116,15 +116,18 @@ fn ensure_dir(mut path: PathBuf, subdir: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-const BLOB_MAGIC: &[u8] = &[98, 108, 111, 98, 32];
-
 fn hash_object<W: Write>(objects: Vec<String>, persist: bool, mut output: W) -> Result<()> {
     let objects_dir = ensure_dir(find_git_dir()?, "objects")?;
     for object in objects {
         let mut hasher = Sha1::new();
         let path = PathBuf::from(object);
         let mut file = fs::File::open(&path)?;
-        let size = io::copy(&mut file, &mut hasher)?;
+        let size = file.metadata()?.len();
+        let header = format!("blob {}\0", size);
+        hasher.update(&header);
+        if size != io::copy(&mut file, &mut hasher)? {
+            bail!("Disparity between the file size and the number of copied bytes");
+        }
         let hash = format!("{:x}", hasher.finalize());
         writeln!(output, "{}", hash)?;
 
@@ -138,9 +141,7 @@ fn hash_object<W: Write>(objects: Vec<String>, persist: bool, mut output: W) -> 
                 .open(write_path)?;
             let writer = BufWriter::new(dfile);
             let mut encoder = ZlibEncoder::new(writer, Compression::new(9));
-            encoder.write(BLOB_MAGIC)?;
-            write!(encoder, "{size}")?;
-            encoder.write(&[0])?;
+            encoder.write(header.as_ref())?;
             file.rewind()?;
             io::copy(&mut file, &mut encoder)?;
         }
