@@ -1,8 +1,12 @@
-use std::{fs, path::PathBuf, io::{BufReader, BufRead, Read, Write, self}};
+use std::{fs, path::PathBuf, io::{BufReader, BufRead, Read, Write, self, BufWriter, Seek}};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use flate2::read::ZlibDecoder;
+use flate2::{
+    read::ZlibDecoder,
+    write::ZlibEncoder, Compression,
+};
+use sha1::{Sha1, Digest};
 
 const BUF_SIZE: usize = 4096;
 
@@ -24,6 +28,12 @@ enum Commands {
         p: bool,
         object: String,
     },
+    /// 
+    HashObject {
+        #[arg(short)]
+        w: bool,
+        object: Vec<String>,
+    }
 }
 
 fn initialize_git_directory() -> Result<()> {
@@ -33,6 +43,17 @@ fn initialize_git_directory() -> Result<()> {
     fs::write(".git/HEAD", "ref: refs/heads/master\n")?;
 
     Ok(())
+}
+
+fn find_git_dir() -> Result<PathBuf> {
+    // At the moment this function just returns the .git in the current working
+    // directory, if any. Not making it recursive to avoid screwing with real git
+    // projects until things are stable
+    let path = PathBuf::from(".git");
+    if !path.is_dir() {
+        bail!("fatal: not a git repository (or any of the parent directories): .git");
+    }
+    Ok(path)
 }
 
 fn valid_partial_sha1_name(name: &str) -> bool {
@@ -50,7 +71,8 @@ fn cat_file<W: Write>(object: String, mut output: W) -> Result<()> {
         bail!("Not a valid object name {}", object);
     }
     let (prefix, rest) = &object.split_at(2);
-    let mut dir = PathBuf::from(".git/objects");
+    let mut dir = find_git_dir()?;
+    dir.push("objects");
     dir.push(prefix);
     let mut candidates = fs::read_dir(dir)?
         .into_iter()
@@ -63,9 +85,7 @@ fn cat_file<W: Write>(object: String, mut output: W) -> Result<()> {
     }
 
     let path = candidates.pop().unwrap()?.path();
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .open(path)?;
+    let file = fs::File::open(path)?;
     let decoder = ZlibDecoder::new(file);
     let mut reader = BufReader::new(decoder);
     let mut header = vec![];
@@ -87,6 +107,48 @@ fn cat_file<W: Write>(object: String, mut output: W) -> Result<()> {
     Ok(())
 }
 
+fn ensure_dir(mut path: PathBuf, subdir: &str) -> Result<PathBuf> {
+    path.push(subdir);
+    if !path.is_dir() {
+        fs::create_dir_all(&path)?;
+    }
+
+    Ok(path)
+}
+
+const BLOB_MAGIC: &[u8] = &[98, 108, 111, 98, 32];
+
+fn hash_object<W: Write>(objects: Vec<String>, persist: bool, mut output: W) -> Result<()> {
+    let objects_dir = ensure_dir(find_git_dir()?, "objects")?;
+    for object in objects {
+        let mut hasher = Sha1::new();
+        let path = PathBuf::from(object);
+        let mut file = fs::File::open(&path)?;
+        let size = io::copy(&mut file, &mut hasher)?;
+        let hash = format!("{:x}", hasher.finalize());
+        writeln!(output, "{}", hash)?;
+
+        if persist {
+            let mut write_path = ensure_dir(objects_dir.clone(), &hash[..2])?;
+            write_path.push(PathBuf::from(&hash[2..]));
+            let dfile = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(write_path)?;
+            let writer = BufWriter::new(dfile);
+            let mut encoder = ZlibEncoder::new(writer, Compression::new(9));
+            encoder.write(BLOB_MAGIC)?;
+            write!(encoder, "{size}")?;
+            encoder.write(&[0])?;
+            file.rewind()?;
+            io::copy(&mut file, &mut encoder)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn do_command(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init => {
@@ -94,6 +156,9 @@ fn do_command(cli: Cli) -> Result<()> {
         },
         Commands::CatFile { object, .. } => {
             cat_file(object, io::stdout())?;
+        }
+        Commands::HashObject { w, object } => {
+            hash_object(object, w, io::stdout())?;
         }
     }
 
