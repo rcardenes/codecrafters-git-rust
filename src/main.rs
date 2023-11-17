@@ -1,12 +1,9 @@
-use std::{fs, path::PathBuf, io::{BufReader, BufRead, Read, Write, self, BufWriter, Seek}};
+use std::{fs, io::{BufReader, BufRead, Read, Write, self}};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use flate2::{
-    read::ZlibDecoder,
-    write::ZlibEncoder, Compression,
-};
-use sha1::{Sha1, Digest};
+use flate2::read::ZlibDecoder;
+use git_starter_rust::{ObjectManipulator, get_object_path};
 
 const BUF_SIZE: usize = 4096;
 
@@ -40,6 +37,8 @@ enum Commands {
         name_only: bool,
         tree_ish: String,
     },
+    /// Create a tree object from the current index
+    WriteTree,
 }
 
 fn initialize_git_directory() -> Result<()> {
@@ -49,50 +48,6 @@ fn initialize_git_directory() -> Result<()> {
     fs::write(".git/HEAD", "ref: refs/heads/master\n")?;
 
     Ok(())
-}
-
-fn find_git_dir() -> Result<PathBuf> {
-    // At the moment this function just returns the .git in the current working
-    // directory, if any. Not making it recursive to avoid screwing with real git
-    // projects until things are stable
-    let path = PathBuf::from(".git");
-    if !path.is_dir() {
-        bail!("fatal: not a git repository (or any of the parent directories): .git");
-    }
-    Ok(path)
-}
-
-fn valid_partial_sha1_name(name: &str) -> bool {
-    // SHA1 hashes are 160 bits or 20 bytes. This translates to 40 hex characters.
-    // For partial unique names we need a minimum of 4 characters (2 bytes)
-    name.len() > 3 &&
-        name.len() < 41 &&
-        name.chars().all(|c| ('0'..='9').contains(&c) || ('a'..='z').contains(&c))
-}
-
-fn get_object_path(object: &str) -> Result<PathBuf> {
-    let object = object.to_lowercase();
-
-    if !valid_partial_sha1_name(&object) {
-        bail!("Not a valid object name {}", object);
-    }
-
-    let (prefix, rest) = &object.split_at(2);
-    let mut dir = find_git_dir()?;
-    dir.push("objects");
-    dir.push(prefix);
-
-    let mut candidates = fs::read_dir(dir)?
-        .into_iter()
-        .filter(|e| e.as_ref().is_ok_and(|e| {
-            e.path().file_name().unwrap().to_string_lossy().starts_with(rest)
-        }))
-    .collect::<Vec<_>>();
-    if candidates.len() != 1 {
-        bail!("Not a valid object name {}", object);
-    }
-
-    Ok(candidates.pop().unwrap()?.path())
 }
 
 fn cat_file<W: Write>(object: String, mut output: W) -> Result<()> {
@@ -118,47 +73,17 @@ fn cat_file<W: Write>(object: String, mut output: W) -> Result<()> {
     Ok(())
 }
 
-fn ensure_dir(mut path: PathBuf, subdir: &str) -> Result<PathBuf> {
-    path.push(subdir);
-    if !path.is_dir() {
-        fs::create_dir_all(&path)?;
-    }
-
-    Ok(path)
-}
-
 fn hash_object<W: Write>(objects: Vec<String>, persist: bool, mut output: W) -> Result<()> {
     // TODO: This can be done in a much more efficient way, writing to both the hasher
     // and the destination file (if persisting) at the same time. Leave it for
     // later.
-    let objects_dir = ensure_dir(find_git_dir()?, "objects")?;
     for object in objects {
-        let mut hasher = Sha1::new();
-        let path = PathBuf::from(object);
-        let mut file = fs::File::open(&path)?;
-        let size = file.metadata()?.len();
-        let header = format!("blob {}\0", size);
-        hasher.update(&header);
-        if size != io::copy(&mut file, &mut hasher)? {
-            bail!("Disparity between the file size and the number of copied bytes");
-        }
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = if persist {
+            ObjectManipulator::new()?.write_object(&object)?
+        } else {
+            ObjectManipulator::hash_blob(&object)?
+        };
         writeln!(output, "{}", hash)?;
-
-        if persist {
-            let mut write_path = ensure_dir(objects_dir.clone(), &hash[..2])?;
-            write_path.push(PathBuf::from(&hash[2..]));
-            let dfile = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(write_path)?;
-            let writer = BufWriter::new(dfile);
-            let mut encoder = ZlibEncoder::new(writer, Compression::new(9));
-            encoder.write(header.as_ref())?;
-            file.rewind()?;
-            io::copy(&mut file, &mut encoder)?;
-        }
     }
 
     Ok(())
@@ -196,6 +121,10 @@ fn ls_tree<W: Write>(object: String, mut output: W) -> Result<()> {
     Ok(())
 }
 
+fn write_tree<W: Write>(output: W) -> Result<()> {
+    todo!();
+}
+
 fn do_command(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init => {
@@ -209,6 +138,9 @@ fn do_command(cli: Cli) -> Result<()> {
         }
         Commands::LsTree { tree_ish, .. } => {
             ls_tree(tree_ish, io::stdout())?;
+        }
+        Commands::WriteTree => {
+            write_tree(io::stdout())?;
         }
     }
 
