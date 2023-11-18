@@ -1,9 +1,9 @@
-use std::{fs, io::{BufReader, BufRead, Read, Write, self}};
+use std::{fs, io::{BufReader, BufRead, Read, Write, self}, path::PathBuf, ffi::OsStr, os::unix::ffi::OsStrExt};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use flate2::read::ZlibDecoder;
-use git_starter_rust::{ObjectManipulator, get_object_path};
+use git_starter_rust::{GIT_DIR, ObjectManipulator, get_object_path, ensure_dir};
 
 const BUF_SIZE: usize = 4096;
 
@@ -42,10 +42,13 @@ enum Commands {
 }
 
 fn initialize_git_directory() -> Result<()> {
-    fs::create_dir(".git")?;
-    fs::create_dir(".git/objects")?;
-    fs::create_dir(".git/refs")?;
-    fs::write(".git/HEAD", "ref: refs/heads/master\n")?;
+    let mut path = PathBuf::from(&GIT_DIR);
+    fs::create_dir(&path)?;
+    for subdir in ["objects", "refs"] {
+        let _ = ensure_dir(path.clone(), subdir)?;
+    }
+    path.push("HEAD");
+    fs::write(path, "ref: refs/heads/master\n")?;
 
     Ok(())
 }
@@ -79,7 +82,7 @@ fn hash_object<W: Write>(objects: Vec<String>, persist: bool, mut output: W) -> 
     // later.
     for object in objects {
         let hash = if persist {
-            ObjectManipulator::new()?.write_object(&object)?
+            ObjectManipulator::write_blob(&PathBuf::from(object))?
         } else {
             ObjectManipulator::hash_blob(&object)?
         };
@@ -121,8 +124,15 @@ fn ls_tree<W: Write>(object: String, mut output: W) -> Result<()> {
     Ok(())
 }
 
-fn write_tree<W: Write>(output: W) -> Result<()> {
-    todo!();
+fn write_tree<W: Write>(mut output: W) -> Result<()> {
+    let this_dir = PathBuf::from(".");
+    let hash = ObjectManipulator::write_tree(&this_dir, |p| {
+        let git_dir = OsStr::from_bytes(GIT_DIR.as_bytes());
+        p.file_name() != Some(&git_dir)
+        })?;
+    writeln!(output, "{}", hash)?;
+
+    Ok(())
 }
 
 fn do_command(cli: Cli) -> Result<()> {

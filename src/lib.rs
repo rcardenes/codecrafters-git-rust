@@ -4,14 +4,17 @@ use tempfile::NamedTempFile;
 use std::{
     fs,
     path::{PathBuf, Path},
-    io::{self, Write},
+    io::{self, Write}, os::unix::fs::PermissionsExt,
 };
 use sha1::{Sha1, Digest};
+
+pub const GIT_DIR: &str = ".git";
 
 pub struct ObjectWriter {
     hasher: Sha1,
     temp_path: Box<Path>,
     file: ZlibEncoder<NamedTempFile>,
+    renamed: bool,
 }
 
 impl ObjectWriter {
@@ -23,18 +26,33 @@ impl ObjectWriter {
             hasher: Sha1::new(),
             temp_path: temp.path().into(),
             file: ZlibEncoder::new(temp, Compression::new(9)),
+            renamed: false,
         })
     }
 
-    pub fn finalize(self) -> Result<String> {
-        let hash = format!("{:x}", self.hasher.finalize());
+    pub fn finalize(mut self) -> Result<String> {
+        let hash = format!("{:x}", self.hasher.finalize_reset());
         let mut path = find_git_dir()?;
         path.push("objects");
         let mut new_path = ensure_dir(path, &hash[..2])?;
         new_path.push(&hash[2..]);
-        fs::rename(self.temp_path, new_path)?;
+        fs::rename(&self.temp_path, new_path)?;
+        self.renamed = true;
 
         Ok(hash)
+    }
+}
+
+impl Drop for ObjectWriter {
+    fn drop(&mut self) {
+        if !self.renamed {
+            eprintln!("Removing non-renamed temporary file");
+            if let Err(error) = fs::remove_file(&self.temp_path) {
+                eprintln!("Trying to remove temporary file {}: {}",
+                          self.temp_path.file_name().unwrap().to_string_lossy(),
+                          error);
+            }
+        }
     }
 }
 
@@ -50,22 +68,55 @@ impl Write for ObjectWriter {
 }
 
 pub struct ObjectManipulator {
-    object_root: PathBuf,
+//    object_root: PathBuf,
+}
+
+struct TreeEntry {
+    mode: String,
+    name: String,
+    hash: String,
+}
+
+impl TreeEntry {
+    fn len_as_bytes(&self) -> usize {
+        // The format consists on a number digits describing the mode, followed by a space,
+        // then a zero-terminated name string, and 20 bytes with the SHA1 checksum of
+        // the object. Hence 20 + 1 + 1 + name.len() + mode.len
+        self.name.len() + self.mode.len() + 22
+    }
+
+    fn as_bytes(&self) -> Vec<u8> {
+        let hash_u8 = self.hash.chars()
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .map(|tbyte| {
+                let st: String = tbyte.into_iter().collect();
+                u8::from_str_radix(&st, 16).unwrap()
+            })
+            .collect::<Vec<_>>();
+        vec![
+            self.mode.as_bytes(),
+            &[32],
+            self.name.as_bytes(),
+            &[0],
+            &hash_u8,
+        ].concat()
+    }
 }
 
 impl ObjectManipulator {
-    pub fn new() -> Result<Self> {
-        Ok(Self::new_at(find_git_dir()?))
-    }
-
-    pub fn new_at(path: PathBuf) -> Self {
-        let mut path = path;
-        path.push("objects");
-
-        ObjectManipulator {
-            object_root: path,
-        }
-    }
+//    pub fn new() -> Result<Self> {
+//        Ok(Self::new_at(find_git_dir()?))
+//    }
+//
+//    pub fn new_at(path: PathBuf) -> Self {
+//        let mut path = path;
+//        path.push("objects");
+//
+//        ObjectManipulator {
+//            object_root: path,
+//        }
+//    }
 
     pub fn hash_blob(path: &str) -> Result<String> {
         let mut hasher = Sha1::new();
@@ -82,7 +133,7 @@ impl ObjectManipulator {
         Ok(hash)
     }
 
-    pub fn write_object(&self, object: &str) -> Result<String> {
+    pub fn write_blob(object: &Path) -> Result<String> {
         // TODO: This can be done in a much more efficient way, writing to both the hasher
         // and the destination file (if persisting) at the same time. Leave it for
         // later.
@@ -97,6 +148,42 @@ impl ObjectManipulator {
             bail!("Disparity between the file size and the number of copied bytes");
         }
 
+        writer.finalize()
+    }
+
+    pub fn write_tree(path: &Path, filter: fn (&Path) -> bool) -> Result<String> {
+        let mut writer = ObjectWriter::new()?;
+
+        let mut contents = vec![];
+        
+        let mut it = fs::read_dir(&path)?;
+        while let Some(Ok(entry)) = it.next() {
+            let entry_path = entry.path();
+            if !filter(&entry_path) {
+                continue
+            }
+
+            let hash = if entry_path.is_dir() {
+                Self::write_tree(&entry_path, filter)?
+            } else {
+                Self::write_blob(&entry_path)?
+            };
+            let name = entry_path.file_name().unwrap().to_string_lossy().into();
+            let meta = entry_path.metadata()?;
+            let raw_mode = meta.permissions().mode();
+            let mode = String::from(
+                if meta.file_type().is_dir() { "40000" }
+                else if meta.file_type().is_symlink() { "120000" }
+                else if (raw_mode & 0o111) != 0 { "100755" }
+                else { "100644" }
+            );
+            contents.push(TreeEntry { mode, name, hash });
+        }
+        contents.sort_by_key(|te| te.name.clone());
+        write!(writer, "tree {}\0", contents.iter().map(|te| te.len_as_bytes()).sum::<usize>())?;
+        for entry in contents {
+            writer.write(&entry.as_bytes())?;
+        }
         writer.finalize()
     }
 
@@ -148,20 +235,11 @@ pub fn get_object_path(object: &str) -> Result<PathBuf> {
     Ok(candidates.pop().unwrap()?.path())
 }
 
-fn ensure_dir(mut path: PathBuf, subdir: &str) -> Result<PathBuf> {
+pub fn ensure_dir(mut path: PathBuf, subdir: &str) -> Result<PathBuf> {
     path.push(subdir);
     if !path.is_dir() {
         fs::create_dir_all(&path)?;
     }
 
-    Ok(path)
-}
-
-fn compose_dir(subdir: &str) -> Result<PathBuf> {
-    let mut path = find_git_dir()?;
-    path.push(subdir);
-    if !path.is_dir() {
-        bail!("fatal: expected to find subdirectory {}", subdir)
-    }
     Ok(path)
 }
