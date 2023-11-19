@@ -1,14 +1,15 @@
 use anyhow::{Result, bail};
-use flate2::{write::ZlibEncoder, Compression};
+use flate2::{write::ZlibEncoder, Compression, read::ZlibDecoder};
 use tempfile::NamedTempFile;
 use std::{
     fs,
     path::{PathBuf, Path},
-    io::{self, Write}, os::unix::fs::PermissionsExt,
+    io::{self, Write, BufRead, BufReader, Read}, os::unix::fs::PermissionsExt, time::{SystemTime, Duration},
 };
 use sha1::{Sha1, Digest};
 
 pub const GIT_DIR: &str = ".git";
+const SHA1_LENGTH: usize = 20;
 
 pub struct ObjectWriter {
     hasher: Sha1,
@@ -71,7 +72,7 @@ pub struct ObjectManipulator {
 //    object_root: PathBuf,
 }
 
-struct TreeEntry {
+pub struct TreeEntry {
     mode: String,
     name: String,
     hash: String,
@@ -101,6 +102,46 @@ impl TreeEntry {
             &[0],
             &hash_u8,
         ].concat()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+pub struct CommitInfo {
+    tree_sha: String,
+    parent_sha: Option<String>,
+    author_name: String,
+    author_email: String,
+    stamp: Duration,
+    commit_message: String,
+}
+
+impl CommitInfo {
+    pub fn new(sha: &str, parent_sha: Option<&str>, name: &str, mail: &str, message: &str) -> Self {
+        CommitInfo {
+            tree_sha: sha.into(),
+            parent_sha: parent_sha.map(|st| st.to_string()),
+            author_name: name.into(),
+            author_email: mail.into(),
+            stamp: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
+            commit_message: message.into(),
+        }
+    }
+
+    pub fn into_string(self) -> String {
+        let mut res_vec = vec![format!("tree {}", self.tree_sha)];
+        if let Some(parent) = self.parent_sha {
+            res_vec.push(format!("parent {}", parent));
+        }
+        let stamp = format!("{} +0000", self.stamp.as_secs());
+        res_vec.push(format!("author {} <{}> {}", &self.author_name, &self.author_email, stamp));
+        res_vec.push(format!("committer {} <{}> {}", self.author_name, self.author_email, stamp));
+        res_vec.push(format!("\n{}\n", self.commit_message));
+
+
+        res_vec.join("\n")
     }
 }
 
@@ -151,6 +192,48 @@ impl ObjectManipulator {
         writer.finalize()
     }
 
+    pub fn read_tree(object: &str) -> Result<Vec<TreeEntry>> {
+        let file = fs::File::open(get_object_path(&object)?)?;
+        let decoder = ZlibDecoder::new(file);
+        let mut reader = BufReader::new(decoder);
+        let mut header = vec![];
+        reader.read_until(0, &mut header)?;
+        let header = String::from_utf8(header)?;
+
+        let mut contents = vec![];
+        if header.starts_with("tree ") {
+            let (_, raw_length) = header.split_at(5);
+            let mut left = raw_length[..(raw_length.len() - 1)].parse::<usize>()?;
+
+            let mut hash_buf = vec![0; SHA1_LENGTH];
+            while left > 0 {
+                let mut path_header_raw = vec![];
+                let header_bytes = reader.read_until(0, &mut path_header_raw)?;
+                reader.read_exact(&mut hash_buf)?;
+                if let Some((mode, vec)) = String::from_utf8(path_header_raw)?.split_once(" ") {
+                    left -= header_bytes + SHA1_LENGTH;
+                    let hash = hash_buf
+                        .iter()
+                        .map(|byte| format!("{:x}", byte))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    contents.push(TreeEntry {
+                        mode: mode.to_string(),
+                        name: (&vec[..vec.len() - 1]).to_string(),
+                        hash
+                    });
+                } else {
+                    bail!("corrupt stuff!")
+                }
+            } 
+        } else {
+            bail !("fatal: {} is not a valid 'tree' object", object);
+        }
+
+        Ok(contents)
+    }
+
+
     pub fn write_tree(path: &Path, filter: fn (&Path) -> bool) -> Result<String> {
         let mut writer = ObjectWriter::new()?;
 
@@ -187,6 +270,14 @@ impl ObjectManipulator {
         writer.finalize()
     }
 
+    pub fn write_commit(info: CommitInfo) -> Result<String> {
+        let info_string = info.into_string();
+        let info_bytes = info_string.as_bytes();
+        let mut writer = ObjectWriter::new()?;
+        write!(writer, "commit {}\0", info_bytes.len())?;
+        writer.write(info_bytes)?;
+        writer.finalize()
+    }
 }
 
 fn find_git_dir() -> Result<PathBuf> {

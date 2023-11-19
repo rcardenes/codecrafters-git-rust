@@ -1,9 +1,13 @@
-use std::{fs, io::{BufReader, BufRead, Read, Write, self}, path::PathBuf, ffi::OsStr, os::unix::ffi::OsStrExt};
-
-use anyhow::{bail, Result};
+use std::{fs,
+    io::{BufReader, BufRead, Read, Write, self},
+    path::PathBuf,
+    ffi::OsStr,
+    os::unix::ffi::OsStrExt
+};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use flate2::read::ZlibDecoder;
-use git_starter_rust::{GIT_DIR, ObjectManipulator, get_object_path, ensure_dir};
+use git_starter_rust::{GIT_DIR, ObjectManipulator, get_object_path, ensure_dir, CommitInfo};
 
 const BUF_SIZE: usize = 4096;
 
@@ -39,6 +43,16 @@ enum Commands {
     },
     /// Create a tree object from the current index
     WriteTree,
+    /// Create a new commit object
+    CommitTree {
+        tree_sha: String,
+        // id of a parent commit object
+        #[arg(short)]
+        p: Option<String>,
+        // commit message
+        #[arg(short)]
+        m: String,
+    },
 }
 
 fn initialize_git_directory() -> Result<()> {
@@ -92,33 +106,9 @@ fn hash_object<W: Write>(objects: Vec<String>, persist: bool, mut output: W) -> 
     Ok(())
 }
 
-const SHA1_LENGTH: usize = 20;
-
 fn ls_tree<W: Write>(object: String, mut output: W) -> Result<()> {
-    let file = fs::File::open(get_object_path(&object)?)?;
-    let decoder = ZlibDecoder::new(file);
-    let mut reader = BufReader::new(decoder);
-    let mut header = vec![];
-    reader.read_until(0, &mut header)?;
-    let header = String::from_utf8(header)?;
-
-    if header.starts_with("tree ") {
-        let (_, raw_length) = header.split_at(5);
-        let mut left = raw_length[..(raw_length.len() - 1)].parse::<usize>()?;
-
-        let mut hash_buf = vec![0; SHA1_LENGTH];
-        while left > 0 {
-            let mut path_header_raw = vec![];
-            let header_bytes = reader.read_until(0, &mut path_header_raw)?;
-            reader.read_exact(&mut hash_buf)?;
-            if let Some((_, vec)) = String::from_utf8(path_header_raw)?.split_once(" ") {
-                left -= header_bytes + SHA1_LENGTH;
-                writeln!(output, "{}", &vec[..vec.len() - 1])?;
-            } else {
-                bail!("corrupt stuff!")
-            }
-        } 
-        output.flush()?;
+    for entry in ObjectManipulator::read_tree(&object)? {
+        writeln!(output, "{}", &entry.name())?;
     }
 
     Ok(())
@@ -131,6 +121,23 @@ fn write_tree<W: Write>(mut output: W) -> Result<()> {
         p.file_name() != Some(&git_dir)
         })?;
     writeln!(output, "{}", hash)?;
+
+    Ok(())
+}
+
+const AUTHOR: &str = "Ricardo Cárdenes";
+const EMAIL: &str = "ricardo.cardenes@foo.bar";
+
+fn commit_tree<W: Write>(object: String, commit_message: String, parent: Option<String>, mut output: W) -> Result<()> {
+    // Just to verify we're committing a tree
+    let _ = ObjectManipulator::read_tree(&object)?;
+
+    let info = CommitInfo::new(&object,
+                               parent.as_ref().map(|x| x.as_str()),
+                               AUTHOR,
+                               EMAIL,
+                               &commit_message);
+    writeln!(output, "{}", ObjectManipulator::write_commit(info)?)?;
 
     Ok(())
 }
@@ -151,6 +158,9 @@ fn do_command(cli: Cli) -> Result<()> {
         }
         Commands::WriteTree => {
             write_tree(io::stdout())?;
+        }
+        Commands::CommitTree { tree_sha, m, p } => {
+            commit_tree(tree_sha, m, p, io::stdout())?;
         }
     }
 
